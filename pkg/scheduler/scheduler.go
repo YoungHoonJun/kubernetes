@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -106,6 +107,9 @@ type Scheduler struct {
 
 	// registeredHandlers contains the registrations of all handlers. It's used to check if all handlers have finished syncing before the scheduling cycles start.
 	registeredHandlers []cache.ResourceEventHandlerRegistration
+
+	// for lock
+	lock sync.RWMutex
 }
 
 func (sched *Scheduler) applyDefaultHandlers() {

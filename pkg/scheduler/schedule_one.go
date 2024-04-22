@@ -67,6 +67,72 @@ const (
 	numberOfHighestScoredNodesToReport = 3
 )
 
+func (sched *Scheduler) checkMPIJob(podName string) (string, bool) {
+	podNameSlice := strings.Split(podName, "-")
+
+	if podNameSlice[len(podNameSlice)-1] == "launcher" {
+		MPIJobName := strings.Join(podNameSlice[:len(podNameSlice)-1], "-")
+		return MPIJobName, true
+	} else if podNameSlice[len(podNameSlice)-2] == "worker" {
+		MPIJobName := strings.Join(podNameSlice[:len(podNameSlice)-2], "-")
+		return MPIJobName, true
+	}
+	return "", false
+}
+
+func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName string) int64 {
+	config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+	if err != nil {
+		klog.Infof("Failed to get in-cluster config: %v", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		klog.Infof("Failed to create dynamic client: %v", err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "kubeflow.org",
+		Version:  "v1",
+		Resource: "mpijobs",
+	}
+	MPIJob, err := dynamicClient.Resource(gvr).Namespace("my-ns").Get(ctx, MPIJobName, metav1.GetOptions{})
+	if err != nil {
+		klog.Infof("Failed to list MPIJobs: %v", err)
+	}
+	requestGPUcount, found, err := unstructured.NestedInt64(MPIJob.Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
+	if err != nil {
+		klog.Infof("Error reading replicas: %v", err)
+	}
+	if !found {
+		klog.Infof("Replicas not found")
+	}
+
+	return requestGPUcount
+}
+
+func (sched *Scheduler) schedAnnotationSetter(podInfo *framework.QueuedPodInfo, schedStatus string) string {
+	if podInfo.PodInfo.Pod.ObjectMeta.Annotations == nil {
+		podInfo.PodInfo.Pod.ObjectMeta.Annotations = make(map[string]string)
+	}
+	sched.lock.Lock()
+	podInfo.PodInfo.Pod.ObjectMeta.Annotations["scheduling-state"] = schedStatus
+	sched.lock.Unlock()
+
+	if temp, check := podInfo.PodInfo.Pod.ObjectMeta.Annotations["scheduling-state"]; check {
+		return temp
+	} else {
+		return "ERROR"
+	}
+}
+
+func (sched *Scheduler) checkUnscheduled(pods []*v1.Pod) bool {
+	for _, pod := range pods {
+		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+			return true
+		}
+	}
+	return false
+}
+
 // scheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
 func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	logger := klog.FromContext(ctx)
@@ -79,63 +145,34 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	if podInfo == nil || podInfo.Pod == nil {
 		return
 	}
-
 	pod := podInfo.Pod
 
-	// check for gang-scheduling
-	var MPIJobName string
-	isMPIJob := false
-	isFirstAllocate := true
-	podName := podInfo.Pod.Name
-	klog.Infof("Pod Name : %v", podName)
-	podNameSlice := strings.Split(podName, "-")
-	if podNameSlice[len(podNameSlice)-1] == "launcher" {
-		isMPIJob = true
-		MPIJobName = strings.Join(podNameSlice[:len(podNameSlice)-1], "-")
-	} else if podNameSlice[len(podNameSlice)-2] == "worker" {
-		isMPIJob = true
-		MPIJobName = strings.Join(podNameSlice[:len(podNameSlice)-2], "-")
-	}
-
+	// check MPIJob for gang-scheduling
+	MPIJobName, isMPIJob := sched.checkMPIJob(podInfo.Pod.Name)
 	if isMPIJob {
-		// 현재 running 작업 중에 돌고 있는 거 있으면 그냥 스케줄링 진행
 		klog.Infof("MPIJob Name : %v", MPIJobName)
-		var runningPodName string
-		var runningMPIJobName string
+		isFirstAllocate := true
 
 		nodes, err := sched.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-		// nodes, err := sched.nodeInfoSnapshot.List()
 		if err != nil {
-			logger.Error(err, "Node info error")
+			klog.Infof("Node info error")
 			return
 		}
 		for _, node := range nodes.Items {
-			pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-				FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
-			})
+			pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name)})
 			if err != nil {
-				klog.Infof("POD LOAD ERROR 1")
+				klog.Infof("PodList load error")
 				continue
 			}
 			for _, pod := range pods.Items {
 				if pod.Namespace != "my-ns" {
 					continue
 				}
-				runningPodName = pod.Name
-				klog.Infof("Now running pod Name : %v", runningPodName)
-				runningPodNameSlice := strings.Split(runningPodName, "-")
-				if runningPodNameSlice[len(runningPodNameSlice)-1] == "launcher" {
-					runningMPIJobName = strings.Join(runningPodNameSlice[:len(runningPodNameSlice)-1], "-")
-					if runningMPIJobName == MPIJobName {
-						isFirstAllocate = false
-						break
-					}
-				} else if runningPodNameSlice[len(runningPodNameSlice)-2] == "worker" {
-					runningMPIJobName = strings.Join(runningPodNameSlice[:len(runningPodNameSlice)-2], "-")
-					if runningMPIJobName == MPIJobName {
-						isFirstAllocate = false
-						break
-					}
+				klog.Infof("Now running pod Name : %v", pod.Name)
+				runningPodIdx, isRunningPodMPIJob := sched.checkMPIJob(pod.Name)
+				if isRunningPodMPIJob && runningPodIdx == MPIJobName {
+					isFirstAllocate = false
+					break
 				}
 			}
 			if !isFirstAllocate {
@@ -144,46 +181,16 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 		}
 
 		if isFirstAllocate {
-			// 처음 할당하는 MPIJob이기 때문에 자원이 충분한지 확인해야됨
-			config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
-			if err != nil {
-				klog.Infof("Failed to get in-cluster config: %v", err)
-			}
-
-			dynamicClient, err := dynamic.NewForConfig(config)
-			if err != nil {
-				klog.Infof("Failed to create dynamic client: %v", err)
-			}
-
-			gvr := schema.GroupVersionResource{
-				Group:    "kubeflow.org",
-				Version:  "v1",
-				Resource: "mpijobs",
-			}
-
-			MPIJob, err := dynamicClient.Resource(gvr).Namespace("my-ns").Get(ctx, MPIJobName, metav1.GetOptions{})
-			if err != nil {
-				klog.Infof("Failed to list MPIJobs: %v", err)
-			}
-
-			requestGPUcount, found, err := unstructured.NestedInt64(MPIJob.Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
-			if err != nil {
-				klog.Infof("Error reading replicas: %v", err)
-			}
-			if !found {
-				klog.Infof("Replicas not found")
-			}
-			klog.Infof("Request GPU num : %v", requestGPUcount)
-
 			capacityGPUcount := 0
 			allocatedGPUcount := 0
+			requestGPUcount := sched.getMPIJobRequestGPUcount(ctx, MPIJobName)
+			klog.Infof("Request GPU num : %v", requestGPUcount)
+
 			for _, node := range nodes.Items {
 				if val, ok := node.Status.Capacity["nvidia.com/gpu"]; ok {
 					capacityGPUcount += int(val.Value())
 				}
-				pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
-					FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
-				})
+				pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name)})
 				if err != nil {
 					klog.Infof("POD LOAD ERROR 2")
 					continue
@@ -199,8 +206,8 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 					}
 				}
 			}
-			klog.Infof("Capacity GPU num : %v, Allocated GPU num : %v", capacityGPUcount, allocatedGPUcount)
 			allocatableGPUcount := capacityGPUcount - allocatedGPUcount
+			klog.Infof("Capacity GPU num : %v, Allocated GPU num : %v, Avaliable GPU num : %v", capacityGPUcount, allocatedGPUcount, allocatableGPUcount)
 
 			if requestGPUcount > int64(allocatableGPUcount) && capacityGPUcount != 0 {
 				fwk, err := sched.frameworkForPod(pod)
@@ -215,6 +222,12 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 				defer cancel()
 				status := framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
 
+				setAnno := sched.schedAnnotationSetter(podInfo, "unscheduled")
+				if setAnno == "ERROR" {
+					klog.Infof("{uns gang sched}Fail to load Annotation")
+				} else {
+					klog.Infof("{uns gang sched}Annotation: %v", setAnno)
+				}
 				sched.FailureHandler(schedulingCycleCtx, fwk, podInfo, status, clearNominatedNode, start)
 				return
 			}
@@ -254,7 +267,17 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	defer cancel()
 
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
+	if assumedPodInfo.PodInfo.Pod.ObjectMeta.Annotations == nil {
+		assumedPodInfo.PodInfo.Pod.ObjectMeta.Annotations = make(map[string]string)
+	}
+
 	if !status.IsSuccess() {
+		setAnno := sched.schedAnnotationSetter(podInfo, "unscheduled")
+		if setAnno == "ERROR" {
+			klog.Infof("{uns normal sched}Fail to load Annotation")
+		} else {
+			klog.Infof("{uns normal sched}Annotation: %v", setAnno)
+		}
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
 		return
 	}
@@ -269,9 +292,37 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 
 		status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
 		if !status.IsSuccess() {
+			setAnno := sched.schedAnnotationSetter(podInfo, "unscheduled")
+			if setAnno == "ERROR" {
+				klog.Infof("{uns binding err}Fail to load Annotation")
+			} else {
+				klog.Infof("{uns binding err}Annotation: %v", setAnno)
+			}
 			sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
 			return
 		}
+
+		var setAnno string
+		if schedStateOfPod, check := assumedPodInfo.PodInfo.Pod.Annotations["scheduling-state"]; !check {
+			if sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInActiveQueue()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInUnschedulablePods()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInBackoffQueue()) {
+				klog.Infof("#######Backfilling#######")
+				setAnno = sched.schedAnnotationSetter(podInfo, "backfilled")
+			} else {
+				klog.Infof("#######Normal sched#######")
+				setAnno = sched.schedAnnotationSetter(podInfo, "scheduled")
+			}
+		} else if schedStateOfPod == "unscheduled" {
+			klog.Infof("#######Retry sched#######")
+			setAnno = sched.schedAnnotationSetter(podInfo, "scheduled")
+			// backfilled 마킹 지워주는 작업 필요
+		}
+
+		if setAnno == "ERROR" {
+			klog.Infof("{success sched}Fail to load Annotation")
+		} else {
+			klog.Infof("{success sched}Annotation: %v", setAnno)
+		}
+
 		// Usually, DonePod is called inside the scheduling queue,
 		// but in this case, we need to call it here because this Pod won't go back to the scheduling queue.
 		sched.SchedulingQueue.Done(assumedPodInfo.Pod.UID)

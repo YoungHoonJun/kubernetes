@@ -123,6 +123,12 @@ type SchedulingQueue interface {
 	Close()
 	// Run starts the goroutines managing the queue.
 	Run(logger klog.Logger)
+	// for get list of activeQ
+	GetPodsInActiveQueue() []*v1.Pod
+	// for get list of unschedulablePods
+	GetPodsInUnschedulablePods() []*v1.Pod
+	// for get list of backoffQ
+	GetPodsInBackoffQueue() []*v1.Pod
 }
 
 // NewSchedulingQueue initializes a priority queue as a new scheduling queue.
@@ -395,6 +401,43 @@ func (p *PriorityQueue) Run(logger klog.Logger) {
 	go wait.Until(func() {
 		p.flushUnschedulablePodsLeftover(logger)
 	}, 30*time.Second, p.stop)
+}
+
+func (p *PriorityQueue) GetPodsInActiveQueue() []*v1.Pod {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	var pods []*v1.Pod
+	for _, podInfo := range p.activeQ.List() {
+		if pod, ok := podInfo.(*framework.QueuedPodInfo); ok {
+			pods = append(pods, pod.Pod)
+		}
+	}
+	return pods
+}
+
+func (p *PriorityQueue) GetPodsInUnschedulablePods() []*v1.Pod {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	var pods []*v1.Pod
+	for _, podInfo := range p.unschedulablePods.podInfoMap {
+		pods = append(pods, podInfo.Pod)
+	}
+	return pods
+}
+
+func (p *PriorityQueue) GetPodsInBackoffQueue() []*v1.Pod {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	var pods []*v1.Pod
+	for _, podInfo := range p.podBackoffQ.List() {
+		if pod, ok := podInfo.(*framework.QueuedPodInfo); ok {
+			pods = append(pods, pod.Pod)
+		}
+	}
+	return pods
 }
 
 // queueingStrategy indicates how the scheduling queue should enqueue the Pod from unschedulable pod pool.
