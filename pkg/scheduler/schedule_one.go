@@ -23,15 +23,20 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/dynamic"
 	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
 	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
@@ -76,6 +81,146 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	}
 
 	pod := podInfo.Pod
+
+	// check for gang-scheduling
+	var MPIJobName string
+	isMPIJob := false
+	isFirstAllocate := true
+	podName := podInfo.Pod.Name
+	klog.Infof("Pod Name : %v", podName)
+	podNameSlice := strings.Split(podName, "-")
+	if podNameSlice[len(podNameSlice)-1] == "launcher" {
+		isMPIJob = true
+		MPIJobName = strings.Join(podNameSlice[:len(podNameSlice)-1], "-")
+	} else if podNameSlice[len(podNameSlice)-2] == "worker" {
+		isMPIJob = true
+		MPIJobName = strings.Join(podNameSlice[:len(podNameSlice)-2], "-")
+	}
+
+	if isMPIJob {
+		// 현재 running 작업 중에 돌고 있는 거 있으면 그냥 스케줄링 진행
+		klog.Infof("MPIJob Name : %v", MPIJobName)
+		var runningPodName string
+		var runningMPIJobName string
+
+		nodes, err := sched.client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+		// nodes, err := sched.nodeInfoSnapshot.List()
+		if err != nil {
+			logger.Error(err, "Node info error")
+			return
+		}
+		for _, node := range nodes.Items {
+			pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
+			})
+			if err != nil {
+				klog.Infof("POD LOAD ERROR 1")
+				continue
+			}
+			for _, pod := range pods.Items {
+				if pod.Namespace != "my-ns" {
+					continue
+				}
+				runningPodName = pod.Name
+				klog.Infof("Now running pod Name : %v", runningPodName)
+				runningPodNameSlice := strings.Split(runningPodName, "-")
+				if runningPodNameSlice[len(runningPodNameSlice)-1] == "launcher" {
+					runningMPIJobName = strings.Join(runningPodNameSlice[:len(runningPodNameSlice)-1], "-")
+					if runningMPIJobName == MPIJobName {
+						isFirstAllocate = false
+						break
+					}
+				} else if runningPodNameSlice[len(runningPodNameSlice)-2] == "worker" {
+					runningMPIJobName = strings.Join(runningPodNameSlice[:len(runningPodNameSlice)-2], "-")
+					if runningMPIJobName == MPIJobName {
+						isFirstAllocate = false
+						break
+					}
+				}
+			}
+			if !isFirstAllocate {
+				break
+			}
+		}
+
+		if isFirstAllocate {
+			// 처음 할당하는 MPIJob이기 때문에 자원이 충분한지 확인해야됨
+			config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+			if err != nil {
+				klog.Infof("Failed to get in-cluster config: %v", err)
+			}
+
+			dynamicClient, err := dynamic.NewForConfig(config)
+			if err != nil {
+				klog.Infof("Failed to create dynamic client: %v", err)
+			}
+
+			gvr := schema.GroupVersionResource{
+				Group:    "kubeflow.org",
+				Version:  "v1",
+				Resource: "mpijobs",
+			}
+
+			MPIJob, err := dynamicClient.Resource(gvr).Namespace("my-ns").Get(ctx, MPIJobName, metav1.GetOptions{})
+			if err != nil {
+				klog.Infof("Failed to list MPIJobs: %v", err)
+			}
+
+			requestGPUcount, found, err := unstructured.NestedInt64(MPIJob.Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
+			if err != nil {
+				klog.Infof("Error reading replicas: %v", err)
+			}
+			if !found {
+				klog.Infof("Replicas not found")
+			}
+			klog.Infof("Request GPU num : %v", requestGPUcount)
+
+			capacityGPUcount := 0
+			allocatedGPUcount := 0
+			for _, node := range nodes.Items {
+				if val, ok := node.Status.Capacity["nvidia.com/gpu"]; ok {
+					capacityGPUcount += int(val.Value())
+				}
+				pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+					FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name),
+				})
+				if err != nil {
+					klog.Infof("POD LOAD ERROR 2")
+					continue
+				}
+				for _, pod := range pods.Items {
+					if pod.Namespace != "my-ns" {
+						continue
+					}
+					for _, container := range pod.Spec.Containers {
+						if gpuRequest, ok := container.Resources.Requests["nvidia.com/gpu"]; ok {
+							allocatedGPUcount += int(gpuRequest.Value())
+						}
+					}
+				}
+			}
+			klog.Infof("Capacity GPU num : %v, Allocated GPU num : %v", capacityGPUcount, allocatedGPUcount)
+			allocatableGPUcount := capacityGPUcount - allocatedGPUcount
+
+			if requestGPUcount > int64(allocatableGPUcount) && capacityGPUcount != 0 {
+				fwk, err := sched.frameworkForPod(pod)
+				if err != nil {
+					// This shouldn't happen, because we only accept for scheduling the pods
+					// which specify a scheduler name that matches one of the profiles.
+					logger.Error(err, "Error occurred")
+					return
+				}
+				start := time.Now()
+				schedulingCycleCtx, cancel := context.WithCancel(ctx)
+				defer cancel()
+				status := framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
+
+				sched.FailureHandler(schedulingCycleCtx, fwk, podInfo, status, clearNominatedNode, start)
+				return
+			}
+		}
+	}
+
 	// TODO(knelasevero): Remove duplicated keys from log entry calls
 	// When contextualized logging hits GA
 	// https://github.com/kubernetes/kubernetes/issues/111672
@@ -961,7 +1106,12 @@ func (sched *Scheduler) finishBinding(logger klog.Logger, fwk framework.Framewor
 		return
 	}
 
-	fwk.EventRecorder().Eventf(assumed, nil, v1.EventTypeNormal, "Scheduled", "Binding", "Successfully assigned %v/%v to %v", assumed.Namespace, assumed.Name, targetNode)
+	// ns := "kube-system"
+	// n := "tensorflow-mnist-elastic-config"
+	// configmap, _ := sched.client.CoreV1().ConfigMaps(ns).List(context.TODO(), metav1.ListOptions{})
+
+	fwk.EventRecorder().Eventf(assumed, nil, v1.EventTypeNormal, "Scheduled", "Binding", "[CSL] Successfully assigned %v/%v to %v", assumed.Namespace, assumed.Name, targetNode)
+	// klog.Infof("%v | %v ", assumed.Name, configmap)
 }
 
 func getAttemptsLabel(p *framework.QueuedPodInfo) string {

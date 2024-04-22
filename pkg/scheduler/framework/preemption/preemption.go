@@ -26,11 +26,16 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/dynamic"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1"
+	"k8s.io/client-go/tools/clientcmd"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -55,6 +60,17 @@ type candidate struct {
 	victims *extenderv1.Victims
 	name    string
 }
+
+// type candidate struct {
+// 	victims []victim
+// 	node    *v1.Node
+// }
+
+// type victim struct {
+// 	pod                *v1.Pod
+// 	backfilledResource int
+// 	scaledResource     int
+// }
 
 // Victims returns s.victims.
 func (s *candidate) Victims() *extenderv1.Victims {
@@ -131,6 +147,138 @@ type Evaluator struct {
 	Interface
 }
 
+// func (ev *Evaluator) ElasticScheduling(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+// 	logger := klog.FromContext(ctx)
+
+// 	// 0) Fetch the latest version of <pod>.
+// 	// It's safe to directly fetch pod here. Because the informer cache has already been
+// 	// initialized when creating the Scheduler obj.
+// 	// However, tests may need to manually initialize the shared pod informer.
+// 	podNamespace, podName := pod.Namespace, pod.Name
+// 	pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
+// 	if err != nil {
+// 		logger.Error(err, "Could not get the updated preemptor pod object", "pod", klog.KRef(podNamespace, podName))
+// 		return nil, framework.AsStatus(err)
+// 	}
+
+// 	// 0) Retrieve GPU resource (Retract & Scale-in)
+// 	// 0-1) Find all retrieve candidates.
+// 	// 유휴 자원 + 백필된 자원 + 스케일-아웃된 자원 중 뺄 수 있는 조합이 있는지 확인
+// 	candidates, err := ev.findRetrieveCandidates(ctx, pod, m)
+// 	if err != nil && len(candidates) == 0 {
+// 		return nil, framework.AsStatus(err)
+// 	}
+
+// 	// Return a FitError only when there are no candidates that fit the pod.
+// 	// 백필되거나 스케일-아웃된 자원이 없다 or 백필되거나 스케일-아웃된 자원으로 해결할 수 없다
+// 	// 자원 할당 단계로 넘어감
+// 	if len(candidates) == 0 {
+// 		// 전처리 (로그 찍기)
+// 		ev.ScaleOut(ctx, pod)
+// 	}
+
+// 	// 0-2) Select best candidate use SelectRetrieveCandidate func.
+// 	// 손익 모델 돌려서 최적의 조합 찾기
+// 	bestCandidate := ev.SelectCandidate(ctx, candidates)
+// 	if bestCandidate == nil || len(bestCandidate.Name()) == 0 {
+// 		return nil, framework.NewStatus(framework.Unschedulable, "no candidate node for preemption")
+// 	}
+
+// 	// 자원 회수 진행
+// 	// 5) Perform preparation work before nominating the selected candidate.
+// 	if status := ev.prepareCandidate(ctx, bestCandidate, pod, ev.PluginName); !status.IsSuccess() {
+// 		return nil, status
+// 	}
+
+// 	// 1) Allocate GPU resource (Backfill & Scale-out)
+
+// 	return framework.NewPostFilterResultWithNominatedNode(bestCandidate.Name()), framework.NewStatus(framework.Success)
+// }
+
+// // FindCandidates calculates a slice of retrieve candidates.
+// // Each candidate is executable to make the given <pod> schedulable.
+// func (ev *Evaluator) findRetrieveCandidates(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) ([]candidate, error) {
+// 	var candidates []candidate
+// 	allNodes, err := ev.Handler.SnapshotSharedLister().NodeInfos().List()
+// 	if err != nil {
+// 		return nil, err
+// 	}
+// 	if len(allNodes) == 0 {
+// 		return nil, errors.New("no nodes available")
+// 	}
+
+// 	logger := klog.FromContext(ctx)
+// 	potentialNodes, _ := nodesWhereRetrieveMightHelp(allNodes, m)
+// 	if len(potentialNodes) == 0 {
+// 		logger.V(3).Info("Retrieve will not help schedule pod on any node", "pod", klog.KObj(pod))
+// 		// In this case, we should clean-up any existing nominated node name of the pod.
+// 		if err := util.ClearNominatedNodeName(ctx, ev.Handler.ClientSet(), pod); err != nil {
+// 			logger.Error(err, "Could not clear the nominatedNodeName field of pod", "pod", klog.KObj(pod))
+// 			// We do not return as this error is not critical.
+// 		}
+// 		return nil, nil
+// 	}
+
+// 	// 포텐셜 노드로부터 가능한 파드 쭉 뽑아오기 -> 여기서 candidate 정의함
+// 	for _, node := range potentialNodes {
+// 		var candidate candidate
+// 		candidate.node = node.Node()
+// 		pods := node.Pods
+// 		for _, pod := range pods {
+// 			var victim victim
+// 			if _, isBackfill := pod.Pod.ObjectMeta.Annotations["backfill-check"]; isBackfill {
+// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["backfill-check"])
+// 				victim.pod = pod.Pod
+// 				victim.backfilledResource = r
+// 				victim.scaledResource = 0
+// 				candidate.victims = append(candidate.victims, victim)
+// 			} else if _, isScaleOut := pod.Pod.ObjectMeta.Annotations["scale-out-check"]; isScaleOut {
+// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["scale-out-check"])
+// 				victim.pod = pod.Pod
+// 				victim.backfilledResource = 0
+// 				victim.scaledResource = r
+// 				candidate.victims = append(candidate.victims, victim)
+// 			}
+// 		}
+// 		candidates = append(candidates, candidate)
+// 	}
+
+// 	return candidates, err
+// }
+
+// // nodesWhereRetrieveMightHelp returns a list of nodes with failed predicates
+// // that may be satisfied by removing pods from the node.
+// func nodesWhereRetrieveMightHelp(nodes []*framework.NodeInfo, m framework.NodeToStatusMap) ([]*framework.NodeInfo, framework.NodeToStatusMap) {
+// 	var isBackfill, isScaleOut bool
+// 	var potentialNodes []*framework.NodeInfo
+// 	nodeStatuses := make(framework.NodeToStatusMap)
+// 	retractableResource := 0
+
+// 	for _, node := range nodes {
+// 		pods := node.Pods
+// 		isBackfill = false
+// 		isScaleOut = false
+// 		for _, pod := range pods {
+// 			if _, isBackfill = pod.Pod.ObjectMeta.Annotations["backfill-check"]; isBackfill {
+// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["backfill-check"])
+// 				retractableResource += r
+// 			} else if _, isScaleOut = pod.Pod.ObjectMeta.Annotations["scale-out-check"]; isScaleOut {
+// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["scale-out-check"])
+// 				retractableResource += r
+// 			}
+
+// 			if isBackfill || isScaleOut {
+// 				potentialNodes = append(potentialNodes, node)
+// 			}
+// 		}
+// 	}
+// 	return potentialNodes, nodeStatuses
+// }
+
+// func (ev *Evaluator) ScaleOut(ctx context.Context, pod *v1.Pod) {
+// 	print("백필 여부 확인하고 스케일 아웃 진행")
+// }
+
 // Preempt returns a PostFilterResult carrying suggested nominatedNodeName, along with a Status.
 // The semantics of returned <PostFilterResult, Status> varies on different scenarios:
 //
@@ -150,12 +298,48 @@ type Evaluator struct {
 func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
 	logger := klog.FromContext(ctx)
 
+	ns := "my-ns"
+	mpiJobName := "tensorflow-mnist-elastic"
+
+	config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+	if err != nil {
+		klog.Infof("Failed to get in-cluster config: %v", err)
+	}
+
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		klog.Infof("Failed to create dynamic client: %v", err)
+	}
+
+	gvr := schema.GroupVersionResource{
+		Group:    "kubeflow.org",
+		Version:  "v1",
+		Resource: "mpijobs",
+	}
+
+	mpiJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, mpiJobName, metav1.GetOptions{})
+	if err != nil {
+		klog.Infof("Failed to list MPIJobs: %v", err)
+	}
+
+	workerReplicasPath := []string{"spec", "mpiReplicaSpecs", "Worker", "replicas"}
+	if err := unstructured.SetNestedField(mpiJob.Object, int64(5), workerReplicasPath...); err != nil {
+		klog.Infof("Failed to set replicas: %v", err)
+	}
+
+	updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Update(ctx, mpiJob, metav1.UpdateOptions{})
+	if err != nil {
+		klog.Infof("Failed to update MPIJob: %v", err)
+	}
+
+	klog.Infof("%v | %v ", pod.Name, updatedMPIJob)
+
 	// 0) Fetch the latest version of <pod>.
 	// It's safe to directly fetch pod here. Because the informer cache has already been
 	// initialized when creating the Scheduler obj.
 	// However, tests may need to manually initialize the shared pod informer.
 	podNamespace, podName := pod.Namespace, pod.Name
-	pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
+	pod, err = ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
 	if err != nil {
 		logger.Error(err, "Could not get the updated preemptor pod object", "pod", klog.KRef(podNamespace, podName))
 		return nil, framework.AsStatus(err)
@@ -379,7 +563,7 @@ func (ev *Evaluator) prepareCandidate(ctx context.Context, c Candidate, pod *v1.
 					}
 				}
 			}
-			if err := util.DeletePod(ctx, cs, victim); err != nil {
+			if err := util.RetractPod(ctx, cs, victim); err != nil {
 				logger.Error(err, "Preempted pod", "pod", klog.KObj(victim), "preemptor", klog.KObj(pod))
 				errCh.SendErrorWithCancel(err, cancel)
 				return

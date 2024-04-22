@@ -18,6 +18,8 @@ package queuesort
 
 import (
 	"context"
+	"time"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -43,7 +45,28 @@ func (pl *PrioritySort) Name() string {
 func (pl *PrioritySort) Less(pInfo1, pInfo2 *framework.QueuedPodInfo) bool {
 	p1 := corev1helpers.PodPriority(pInfo1.Pod)
 	p2 := corev1helpers.PodPriority(pInfo2.Pod)
-	return (p1 > p2) || (p1 == p2 && pInfo1.Timestamp.Before(pInfo2.Timestamp))
+
+	if _, check_1 := pInfo1.Pod.ObjectMeta.Annotations["retract-check-var"]; check_1 {
+		if _, check_2 := pInfo2.Pod.ObjectMeta.Annotations["retract-check-var"]; check_2 {
+			// Both Pods have been retracted
+			p1Timestamp, _ := time.Parse(time.RFC3339, pInfo1.Pod.ObjectMeta.Annotations["retract-check-var"])
+			p2Timestamp, _ := time.Parse(time.RFC3339, pInfo2.Pod.ObjectMeta.Annotations["retract-check-var"])
+			return (p1 > p2) || (p1 == p2 && p1Timestamp.Before(p2Timestamp))
+		} else {
+			// Only p1 have been retracted
+			p1Timestamp, _ := time.Parse(time.RFC3339, pInfo1.Pod.ObjectMeta.Annotations["retract-check-var"])
+			return (p1 > p2) || (p1 == p2 && p1Timestamp.Before(pInfo2.Timestamp))
+		}
+	} else {
+		if _, check_3 := pInfo2.Pod.ObjectMeta.Annotations["retract-check-var"]; check_3 {
+			// Only p2 have been retracted
+			p2Timestamp, _ := time.Parse(time.RFC3339, pInfo2.Pod.ObjectMeta.Annotations["retract-check-var"])
+			return (p1 > p2) || (p1 == p2 && pInfo1.Timestamp.Before(p2Timestamp))
+		} else {
+			// Neither Pod has ever been retracted (Default)
+			return (p1 > p2) || (p1 == p2 && pInfo1.Timestamp.Before(pInfo2.Timestamp))
+		}
+	}
 }
 
 // New initializes a new plugin and returns it.

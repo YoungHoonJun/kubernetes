@@ -138,6 +138,73 @@ func DeletePod(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) error 
 	return cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 }
 
+// RetractPod retracts the victim <pod> from API server
+func RetractPod(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) error {
+	victimPod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       pod.TypeMeta.Kind,
+			APIVersion: pod.TypeMeta.APIVersion,
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:                       pod.ObjectMeta.Name + "-retracted",
+			Namespace:                  pod.ObjectMeta.Namespace,
+			DeletionGracePeriodSeconds: pod.ObjectMeta.DeletionGracePeriodSeconds,
+			Labels:                     pod.ObjectMeta.Labels,
+			Annotations:                pod.ObjectMeta.Annotations,
+		},
+		Spec: v1.PodSpec{
+			Volumes:                       pod.Spec.Volumes,
+			InitContainers:                pod.Spec.InitContainers,
+			Containers:                    pod.Spec.Containers,
+			EphemeralContainers:           pod.Spec.EphemeralContainers,
+			RestartPolicy:                 pod.Spec.RestartPolicy,
+			TerminationGracePeriodSeconds: pod.Spec.TerminationGracePeriodSeconds,
+			ActiveDeadlineSeconds:         pod.Spec.ActiveDeadlineSeconds,
+			DNSPolicy:                     pod.Spec.DNSPolicy,
+			NodeSelector:                  pod.Spec.NodeSelector,
+			ServiceAccountName:            pod.Spec.ServiceAccountName,
+			AutomountServiceAccountToken:  pod.Spec.AutomountServiceAccountToken,
+			ShareProcessNamespace:         pod.Spec.ShareProcessNamespace,
+			SecurityContext:               pod.Spec.SecurityContext,
+			ImagePullSecrets:              pod.Spec.ImagePullSecrets,
+			Hostname:                      pod.Spec.Hostname,
+			Subdomain:                     pod.Spec.Subdomain,
+			Affinity:                      pod.Spec.Affinity,
+			SchedulerName:                 pod.Spec.SchedulerName,
+			Tolerations:                   pod.Spec.Tolerations,
+			PriorityClassName:             pod.Spec.PriorityClassName,
+			Priority:                      pod.Spec.Priority,
+			DNSConfig:                     pod.Spec.DNSConfig,
+			ReadinessGates:                pod.Spec.ReadinessGates,
+			RuntimeClassName:              pod.Spec.RuntimeClassName,
+			EnableServiceLinks:            pod.Spec.EnableServiceLinks,
+			PreemptionPolicy:              pod.Spec.PreemptionPolicy,
+			Overhead:                      pod.Spec.Overhead,
+			TopologySpreadConstraints:     pod.Spec.TopologySpreadConstraints,
+			SetHostnameAsFQDN:             pod.Spec.SetHostnameAsFQDN,
+			OS:                            pod.Spec.OS,
+			HostUsers:                     pod.Spec.HostUsers,
+			ResourceClaims:                pod.Spec.ResourceClaims,
+		},
+	}
+
+	if _, check := victimPod.ObjectMeta.Annotations["retract-check-var"]; !check {
+		victimPod.ObjectMeta.Annotations["retract-check-var"] = pod.ObjectMeta.CreationTimestamp.Format(time.RFC3339)
+	}
+
+	deleteErr := cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
+	if deleteErr != nil {
+		return fmt.Errorf("failed to delete the pod: %v", deleteErr)
+	}
+
+	_, createErr := cs.CoreV1().Pods(victimPod.Namespace).Create(ctx, victimPod, metav1.CreateOptions{})
+	if createErr != nil {
+		return fmt.Errorf("failed to create the pod: %v", createErr)
+	}
+
+	return nil
+}
+
 // ClearNominatedNodeName internally submit a patch request to API server
 // to set each pods[*].Status.NominatedNodeName> to "".
 func ClearNominatedNodeName(ctx context.Context, cs kubernetes.Interface, pods ...*v1.Pod) utilerrors.Aggregate {
