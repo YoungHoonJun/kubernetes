@@ -26,16 +26,11 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/util/feature"
-	"k8s.io/client-go/dynamic"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1"
-	"k8s.io/client-go/tools/clientcmd"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -298,48 +293,48 @@ type Evaluator struct {
 func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
 	logger := klog.FromContext(ctx)
 
-	ns := "my-ns"
-	mpiJobName := "tensorflow-mnist-elastic"
+	// ns := "my-ns"
+	// mpiJobName := "tensorflow-mnist-elastic"
 
-	config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
-	if err != nil {
-		klog.Infof("Failed to get in-cluster config: %v", err)
-	}
+	// config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+	// if err != nil {
+	// 	klog.Infof("Failed to get in-cluster config: %v", err)
+	// }
 
-	dynamicClient, err := dynamic.NewForConfig(config)
-	if err != nil {
-		klog.Infof("Failed to create dynamic client: %v", err)
-	}
+	// dynamicClient, err := dynamic.NewForConfig(config)
+	// if err != nil {
+	// 	klog.Infof("Failed to create dynamic client: %v", err)
+	// }
 
-	gvr := schema.GroupVersionResource{
-		Group:    "kubeflow.org",
-		Version:  "v1",
-		Resource: "mpijobs",
-	}
+	// gvr := schema.GroupVersionResource{
+	// 	Group:    "kubeflow.org",
+	// 	Version:  "v1",
+	// 	Resource: "mpijobs",
+	// }
 
-	mpiJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, mpiJobName, metav1.GetOptions{})
-	if err != nil {
-		klog.Infof("Failed to list MPIJobs: %v", err)
-	}
+	// mpiJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, mpiJobName, metav1.GetOptions{})
+	// if err != nil {
+	// 	klog.Infof("Failed to list MPIJobs: %v", err)
+	// }
 
-	workerReplicasPath := []string{"spec", "mpiReplicaSpecs", "Worker", "replicas"}
-	if err := unstructured.SetNestedField(mpiJob.Object, int64(5), workerReplicasPath...); err != nil {
-		klog.Infof("Failed to set replicas: %v", err)
-	}
+	// workerReplicasPath := []string{"spec", "mpiReplicaSpecs", "Worker", "replicas"}
+	// if err := unstructured.SetNestedField(mpiJob.Object, int64(5), workerReplicasPath...); err != nil {
+	// 	klog.Infof("Failed to set replicas: %v", err)
+	// }
 
-	updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Update(ctx, mpiJob, metav1.UpdateOptions{})
-	if err != nil {
-		klog.Infof("Failed to update MPIJob: %v", err)
-	}
+	// updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Update(ctx, mpiJob, metav1.UpdateOptions{})
+	// if err != nil {
+	// 	klog.Infof("Failed to update MPIJob: %v", err)
+	// }
 
-	klog.Infof("%v | %v ", pod.Name, updatedMPIJob)
+	// klog.Infof("%v | %v ", pod.Name, updatedMPIJob)
 
 	// 0) Fetch the latest version of <pod>.
 	// It's safe to directly fetch pod here. Because the informer cache has already been
 	// initialized when creating the Scheduler obj.
 	// However, tests may need to manually initialize the shared pod informer.
 	podNamespace, podName := pod.Namespace, pod.Name
-	pod, err = ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
+	pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
 	if err != nil {
 		logger.Error(err, "Could not get the updated preemptor pod object", "pod", klog.KRef(podNamespace, podName))
 		return nil, framework.AsStatus(err)

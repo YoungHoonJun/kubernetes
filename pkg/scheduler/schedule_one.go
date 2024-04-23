@@ -109,18 +109,37 @@ func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName
 	return requestGPUcount
 }
 
-func (sched *Scheduler) schedAnnotationSetter(podInfo *framework.QueuedPodInfo, schedStatus string) string {
-	if podInfo.PodInfo.Pod.ObjectMeta.Annotations == nil {
-		podInfo.PodInfo.Pod.ObjectMeta.Annotations = make(map[string]string)
+func (sched *Scheduler) schedAnnotationSetter(pod *v1.Pod, schedStatus string) string {
+	if pod.Annotations == nil {
+		pod.Annotations = make(map[string]string)
 	}
 	sched.lock.Lock()
-	podInfo.PodInfo.Pod.ObjectMeta.Annotations["scheduling-state"] = schedStatus
+	pod.Annotations["scheduling-state"] = schedStatus
 	sched.lock.Unlock()
 
-	if temp, check := podInfo.PodInfo.Pod.ObjectMeta.Annotations["scheduling-state"]; check {
+	if temp, check := pod.Annotations["scheduling-state"]; check {
 		return temp
 	} else {
 		return "ERROR"
+	}
+}
+
+func (sched *Scheduler) updateAnnotations(ctx context.Context, ns string, name string, status string, schedStatus string) {
+	pod, getErr := sched.client.CoreV1().Pods(ns).Get(ctx, name, metav1.GetOptions{})
+	if getErr != nil {
+		klog.Infof("%v", getErr)
+		klog.Infof("{%v} Fail to get", status)
+	}
+	setAnno := sched.schedAnnotationSetter(pod, schedStatus)
+	if setAnno == "ERROR" {
+		klog.Infof("{%v}Fail to load Annotation", status)
+	} else {
+		klog.Infof("{%v}Annotation: %v", status, setAnno)
+	}
+	_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
+	if updateErr != nil {
+		klog.Infof("%v", updateErr)
+		klog.Infof("{%v} Fail to update", status)
 	}
 }
 
@@ -131,6 +150,72 @@ func (sched *Scheduler) checkUnscheduled(pods []*v1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func (sched *Scheduler) findEarliestCreationTime() metav1.Time {
+	var earliest metav1.Time
+	activeQ := sched.SchedulingQueue.GetPodsInActiveQueue()
+	unsQ := sched.SchedulingQueue.GetPodsInUnschedulablePods()
+	backoffQ := sched.SchedulingQueue.GetPodsInBackoffQueue()
+
+	for _, pod := range activeQ {
+		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+			if earliest.IsZero() || pod.CreationTimestamp.Before(&earliest) {
+				earliest = pod.CreationTimestamp
+			}
+		}
+	}
+	for _, pod := range unsQ {
+		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+			if earliest.IsZero() || pod.CreationTimestamp.Before(&earliest) {
+				earliest = pod.CreationTimestamp
+			}
+		}
+	}
+	for _, pod := range backoffQ {
+		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+			if earliest.IsZero() || pod.CreationTimestamp.Before(&earliest) {
+				earliest = pod.CreationTimestamp
+			}
+		}
+	}
+	return earliest
+}
+
+func (sched *Scheduler) backfilledTOscheduled(ctx context.Context, nowPod *v1.Pod, isUnsched bool) {
+	pods, err := sched.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Infof("Pods load error in backfilledTOscheduled")
+		return
+	}
+	for _, pod := range pods.Items {
+		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "backfilled" {
+			if isUnsched {
+				earlist := sched.findEarliestCreationTime()
+				if pod.CreationTimestamp.Before(&earlist) && nowPod.CreationTimestamp.Before(&(pod.CreationTimestamp)) {
+					sched.lock.Lock()
+					pod.Annotations["scheduling-state"] = "scheduled"
+					sched.lock.Unlock()
+					klog.Infof("{1} backfilled -> scheduled || %v", pod.Name)
+					_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, &pod, metav1.UpdateOptions{})
+					if updateErr != nil {
+						klog.Infof("%v", updateErr)
+						klog.Infof("{bTs} Fail to update")
+					}
+				}
+			} else {
+				sched.lock.Lock()
+				pod.Annotations["scheduling-state"] = "scheduled"
+				sched.lock.Unlock()
+				klog.Infof("{2} backfilled -> scheduled || %v", pod.Name)
+				_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, &pod, metav1.UpdateOptions{})
+				if updateErr != nil {
+					klog.Infof("%v", updateErr)
+					klog.Infof("{bTs} Fail to update")
+				}
+			}
+		}
+	}
 }
 
 // scheduleOne does the entire scheduling workflow for a single pod. It is serialized on the scheduling algorithm's host fitting.
@@ -221,14 +306,8 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 				schedulingCycleCtx, cancel := context.WithCancel(ctx)
 				defer cancel()
 				status := framework.NewStatus(framework.UnschedulableAndUnresolvable).WithError(err)
-
-				setAnno := sched.schedAnnotationSetter(podInfo, "unscheduled")
-				if setAnno == "ERROR" {
-					klog.Infof("{uns gang sched}Fail to load Annotation")
-				} else {
-					klog.Infof("{uns gang sched}Annotation: %v", setAnno)
-				}
 				sched.FailureHandler(schedulingCycleCtx, fwk, podInfo, status, clearNominatedNode, start)
+				sched.updateAnnotations(ctx, podInfo.Pod.Namespace, podInfo.Pod.Name, "Fail sched | GangScheduling", "unscheduled")
 				return
 			}
 		}
@@ -267,18 +346,9 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	defer cancel()
 
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
-	if assumedPodInfo.PodInfo.Pod.ObjectMeta.Annotations == nil {
-		assumedPodInfo.PodInfo.Pod.ObjectMeta.Annotations = make(map[string]string)
-	}
-
 	if !status.IsSuccess() {
-		setAnno := sched.schedAnnotationSetter(podInfo, "unscheduled")
-		if setAnno == "ERROR" {
-			klog.Infof("{uns normal sched}Fail to load Annotation")
-		} else {
-			klog.Infof("{uns normal sched}Annotation: %v", setAnno)
-		}
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+		sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Normal", "unscheduled")
 		return
 	}
 
@@ -292,40 +362,56 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 
 		status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
 		if !status.IsSuccess() {
-			setAnno := sched.schedAnnotationSetter(podInfo, "unscheduled")
-			if setAnno == "ERROR" {
-				klog.Infof("{uns binding err}Fail to load Annotation")
-			} else {
-				klog.Infof("{uns binding err}Annotation: %v", setAnno)
-			}
 			sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
+			sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Bind err", "unscheduled")
 			return
 		}
 
-		var setAnno string
-		if schedStateOfPod, check := assumedPodInfo.PodInfo.Pod.Annotations["scheduling-state"]; !check {
-			if sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInActiveQueue()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInUnschedulablePods()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInBackoffQueue()) {
-				klog.Infof("#######Backfilling#######")
-				setAnno = sched.schedAnnotationSetter(podInfo, "backfilled")
-			} else {
-				klog.Infof("#######Normal sched#######")
-				setAnno = sched.schedAnnotationSetter(podInfo, "scheduled")
-			}
-		} else if schedStateOfPod == "unscheduled" {
-			klog.Infof("#######Retry sched#######")
-			setAnno = sched.schedAnnotationSetter(podInfo, "scheduled")
-			// backfilled 마킹 지워주는 작업 필요
+		// Usually, DonePod is called inside the scheduling queue,
+		// but in this case, we need to call it here because this Pod won't go back to the scheduling queue.
+		sched.SchedulingQueue.Done(assumedPodInfo.Pod.UID)
+
+		pod, getErr := sched.client.CoreV1().Pods(assumedPodInfo.Pod.Namespace).Get(ctx, assumedPodInfo.Pod.Name, metav1.GetOptions{})
+		if getErr != nil {
+			klog.Infof("%v", getErr)
+			klog.Infof("{success sched} Fail to get")
 		}
 
+		var setAnno string
+		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; !check {
+			if sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInActiveQueue()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInUnschedulablePods()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInBackoffQueue()) {
+				setAnno = sched.schedAnnotationSetter(pod, "backfilled")
+			} else {
+				setAnno = sched.schedAnnotationSetter(pod, "scheduled")
+			}
+			_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
+			if updateErr != nil {
+				klog.Infof("%v", updateErr)
+				klog.Infof("{success sched} Fail to update")
+			}
+		} else if schedStateOfPod == "unscheduled" {
+			isUnsched := false
+			setAnno = sched.schedAnnotationSetter(pod, "scheduled")
+			_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
+			if updateErr != nil {
+				klog.Infof("%v", updateErr)
+				klog.Infof("{success sched} Fail to update")
+			}
+			if sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInActiveQueue()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInUnschedulablePods()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInBackoffQueue()) {
+				isUnsched = true
+			}
+			sched.backfilledTOscheduled(ctx, assumedPodInfo.PodInfo.Pod, isUnsched)
+		}
 		if setAnno == "ERROR" {
 			klog.Infof("{success sched}Fail to load Annotation")
 		} else {
 			klog.Infof("{success sched}Annotation: %v", setAnno)
 		}
 
-		// Usually, DonePod is called inside the scheduling queue,
-		// but in this case, we need to call it here because this Pod won't go back to the scheduling queue.
-		sched.SchedulingQueue.Done(assumedPodInfo.Pod.UID)
+		pods, _ := sched.client.CoreV1().Pods("my-ns").List(ctx, metav1.ListOptions{})
+		for _, pod := range pods.Items {
+			klog.Infof("%v || %v || %v", pod.Name, pod.CreationTimestamp, pod.Annotations)
+		}
 	}()
 }
 
