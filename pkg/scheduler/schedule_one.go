@@ -253,7 +253,6 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 				if pod.Namespace != "my-ns" {
 					continue
 				}
-				klog.Infof("Now running pod Name : %v", pod.Name)
 				runningPodIdx, isRunningPodMPIJob := sched.checkMPIJob(pod.Name)
 				if isRunningPodMPIJob && runningPodIdx == MPIJobName {
 					isFirstAllocate = false
@@ -348,7 +347,9 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
-		sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Normal", "unscheduled")
+		if !isMPIJob {
+			sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Normal", "unscheduled")
+		}
 		return
 	}
 
@@ -363,7 +364,9 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 		status := sched.bindingCycle(bindingCycleCtx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
 		if !status.IsSuccess() {
 			sched.handleBindingCycleError(bindingCycleCtx, state, fwk, assumedPodInfo, start, scheduleResult, status)
-			sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Bind err", "unscheduled")
+			if !isMPIJob {
+				sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Bind err", "unscheduled")
+			}
 			return
 		}
 
@@ -378,7 +381,14 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 		}
 
 		var setAnno string
-		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; !check {
+		if isMPIJob {
+			setAnno = sched.schedAnnotationSetter(pod, "scheduled")
+			_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
+			if updateErr != nil {
+				klog.Infof("%v", updateErr)
+				klog.Infof("{success sched} Fail to update")
+			}
+		} else if schedStateOfPod, check := pod.Annotations["scheduling-state"]; !check {
 			if sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInActiveQueue()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInUnschedulablePods()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInBackoffQueue()) {
 				setAnno = sched.schedAnnotationSetter(pod, "backfilled")
 			} else {
