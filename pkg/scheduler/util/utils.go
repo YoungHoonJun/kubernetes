@@ -192,6 +192,10 @@ func RetractPod(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) error
 		victimPod.ObjectMeta.Annotations["retract-check-var"] = pod.ObjectMeta.CreationTimestamp.Format(time.RFC3339)
 	}
 
+	if schedStateOfPod, check := victimPod.ObjectMeta.Annotations["scheduling-state"]; check && schedStateOfPod == "backfilled" {
+		victimPod.ObjectMeta.Annotations["scheduling-state"] = ""
+	}
+
 	deleteErr := cs.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
 	if deleteErr != nil {
 		return fmt.Errorf("failed to delete the pod: %v", deleteErr)

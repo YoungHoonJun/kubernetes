@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strconv"
 	"strings"
@@ -28,6 +29,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -195,7 +197,7 @@ func (ev *Evaluator) Dynamic(ctx context.Context, pod *v1.Pod, m framework.NodeT
 			klog.Infof("Replicas not found")
 		}
 		usingGPUs += 1
-		if usingGPUs >= 6 {
+		if usingGPUs > 5 {
 			continue
 		}
 		if maxThroughput < (scalableModelData[annotations["model-name"]][usingGPUs] - scalableModelData[annotations["model-name"]][usingGPUs-1]) {
@@ -212,6 +214,7 @@ func (ev *Evaluator) Dynamic(ctx context.Context, pod *v1.Pod, m framework.NodeT
 func (ev *Evaluator) Retrieve(ctx context.Context, scalableModelData map[string][]float64, nodes *v1.NodeList, idleGPUs int64, requestGPUs int64, runningMPIJobs []string) (bool, string) {
 	var backfilledPods []v1.Pod
 	var scaleOutMPIJobs []*unstructured.Unstructured
+	var retrieveCandidates [][]int
 	for _, node := range nodes.Items {
 		pods, err := ev.Handler.ClientSet().CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name)})
 		if err != nil {
@@ -225,30 +228,17 @@ func (ev *Evaluator) Retrieve(ctx context.Context, scalableModelData map[string]
 		}
 	}
 	for _, MPIJobName := range runningMPIJobs {
-		config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
-		if err != nil {
-			klog.Infof("Failed to get in-cluster config: %v", err)
-		}
-		dynamicClient, err := dynamic.NewForConfig(config)
-		if err != nil {
-			klog.Infof("Failed to create dynamic client: %v", err)
-		}
-		gvr := schema.GroupVersionResource{
-			Group:    "kubeflow.org",
-			Version:  "v1",
-			Resource: "mpijobs",
-		}
-		MPIJob, err := dynamicClient.Resource(gvr).Namespace("my-ns").Get(ctx, MPIJobName, metav1.GetOptions{})
+		MPIJob, err := ev.GetMPIJob(ctx, "my-ns", MPIJobName)
 		if err != nil {
 			klog.Infof("Failed to get MPIJob: %v", err)
 		}
 
 		annotations, found, err := unstructured.NestedStringMap(MPIJob.Object, "metadata", "annotations")
 		if err != nil {
-			klog.Infof("Error loading annotations: %v", err)
+			klog.Infof("Error reading replicas: %v", err)
 		}
 		if !found {
-			klog.Infof("Error finding annotations: %v", err)
+			klog.Infof("Replicas not found")
 		}
 
 		if _, check := annotations["scale-out"]; check {
@@ -256,12 +246,87 @@ func (ev *Evaluator) Retrieve(ctx context.Context, scalableModelData map[string]
 		}
 	}
 
-	// needGPUs := requestGPUs - idleGPUs
+	for i := 0; i < len(backfilledPods); i++ {
+		var backfilledInfo []int
+		var gpuRequest resource.Quantity
+		backfilledInfo = append(backfilledInfo, 0)
+		backfilledInfo = append(backfilledInfo, i)
+		for _, container := range backfilledPods[i].Spec.Containers {
+			gpuRequest = container.Resources.Requests["nvidia.com/gpu"]
+		}
+		backfilledInfo = append(backfilledInfo, int(gpuRequest.Value()))
+		backfilledInfo = append(backfilledInfo, int(scalableModelData[backfilledPods[i].Annotations["model-name"]][int(gpuRequest.Value())]))
+		retrieveCandidates = append(retrieveCandidates, backfilledInfo)
+	}
+	for i := 0; i < len(scaleOutMPIJobs); i++ {
+		var scaleInfo []int
+		scaleInfo = append(scaleInfo, 1)
+		scaleInfo = append(scaleInfo, i)
+		replicas, found, err := unstructured.NestedInt64(scaleOutMPIJobs[i].Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
+		if err != nil {
+			log.Fatalf("Error reading replicas: %s", err.Error())
+		}
+		if !found {
+			log.Fatalf("Replicas not found")
+		}
+		scaleInfo = append(scaleInfo, int(replicas)+1)
 
-	// 필요한 자원과 가장 잘 맞는 조합 찾기 -> 필요한 것 -- 현재 돌고 있는 MPIJob 이름 및 네임스페이스, 해당 작업이 scale-out 한건지
-	// 그리고 회수 및 스케일-인 진행
+		annotations, found, err := unstructured.NestedStringMap(scaleOutMPIJobs[i].Object, "metadata", "annotations")
+		if err != nil {
+			klog.Infof("Error reading replicas: %v", err)
+		}
+		if !found {
+			klog.Infof("Replicas not found")
+		}
+		scaleOutGpus, _ := strconv.Atoi(annotations["scale-out"])
 
-	return false, ""
+		s1 := scalableModelData[annotations["model-name"]][int(replicas)]
+		s2 := scalableModelData[annotations["model-name"]][scaleOutGpus-1]
+		scaleInfo = append(scaleInfo, int(s1-s2))
+		retrieveCandidates = append(retrieveCandidates, scaleInfo)
+	}
+
+	klog.Infof("@@@CANDIDATES : %v", retrieveCandidates)
+	if len(retrieveCandidates) == 0 {
+		return false, ""
+	}
+
+	needGPUs := int(requestGPUs - idleGPUs)
+	if len(retrieveCandidates) < 2 {
+		if retrieveCandidates[0][0] == 0 {
+			err := util.RetractPod(ctx, ev.Handler.ClientSet(), &backfilledPods[0])
+			if err != nil {
+				klog.Infof("Fail retract: %v", err)
+			}
+		} else {
+			ev.MPIJobScaling(ctx, "my-ns", "tensorflow-mnist-elastic", -int64(retrieveCandidates[0][2]))
+		}
+		return true, ""
+	}
+	retrieveCombinations := findCombinations(retrieveCandidates, needGPUs)
+	bestCombination := findBestCombinations(retrieveCombinations)
+	klog.Infof("retrieveCombinations : %v", retrieveCombinations)
+	klog.Infof("bestCombination : %v", bestCombination)
+	checkTemp := false
+	for _, comb := range bestCombination {
+		for _, arr := range comb {
+			if arr[0] == 0 {
+				err := util.RetractPod(ctx, ev.Handler.ClientSet(), &backfilledPods[arr[1]])
+				if err != nil {
+					klog.Infof("Fail retract: %v", err)
+				}
+			} else {
+				ev.MPIJobScaling(ctx, "my-ns", "tensorflow-mnist-elastic", -int64(arr[2]))
+			}
+		}
+		checkTemp = true
+	}
+
+	if checkTemp {
+		return true, ""
+	} else {
+		return false, ""
+	}
 }
 
 func Contains(slice []string, target string) bool {
@@ -271,6 +336,59 @@ func Contains(slice []string, target string) bool {
 		}
 	}
 	return false
+}
+
+func findCombinations(candidates [][]int, n int) [][][]int {
+	var result [][][]int
+	var temp [][]int
+	var sum int
+
+	var backtrack func(int)
+	backtrack = func(start int) {
+		if sum > n {
+			combination := make([][]int, len(temp))
+			for i := range temp {
+				combination[i] = make([]int, len(temp[i]))
+				copy(combination[i], temp[i])
+			}
+			result = append(result, combination)
+			return
+		}
+
+		for i := start; i < len(candidates); i++ {
+			temp = append(temp, candidates[i])
+			sum += candidates[i][2]
+
+			backtrack(i + 1)
+
+			sum -= candidates[i][2]
+			temp = temp[:len(temp)-1]
+		}
+	}
+
+	backtrack(0)
+	return result
+}
+
+func findBestCombinations(combinations [][][]int) [][][]int {
+	minThx := math.MaxInt64
+	var bestCombinations [][][]int
+
+	for _, comb := range combinations {
+		sum := 0
+		for _, arr := range comb {
+			sum += arr[3] // 각 조합의 배열에서 네 번째 요소를 더함
+		}
+		if sum < minThx {
+			minThx = sum
+			bestCombinations = [][][]int{} // 최소값이 갱신되면 조합 배열 초기화
+			bestCombinations = append(bestCombinations, comb)
+		} else if sum == minThx {
+			bestCombinations = append(bestCombinations, comb)
+		}
+	}
+
+	return bestCombinations
 }
 
 func (ev *Evaluator) idleGPUsinNodes(ctx context.Context, nodes *v1.NodeList) int64 {
