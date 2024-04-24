@@ -96,10 +96,12 @@ func (pl *DefaultPreemption) PostFilter(ctx context.Context, state *framework.Cy
 		Interface:  pl,
 	}
 
-	result, status := pe.Preempt(ctx, pod, m)
+	// result, status := pe.Preempt(ctx, pod, m)
+	result, status := pe.Dynamic(ctx, pod, m)
 	msg := status.Message()
 	if len(msg) > 0 {
-		return result, framework.NewStatus(status.Code(), "preemption: "+msg)
+		// return result, framework.NewStatus(status.Code(), "Preemption: "+msg)
+		return result, framework.NewStatus(status.Code(), "Dynamic Resource Allocation: "+msg)
 	}
 	return result, status
 }

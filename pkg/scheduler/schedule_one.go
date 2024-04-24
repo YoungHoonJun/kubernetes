@@ -70,6 +70,10 @@ const (
 func (sched *Scheduler) checkMPIJob(podName string) (string, bool) {
 	podNameSlice := strings.Split(podName, "-")
 
+	if len(podNameSlice) < 2 {
+		return "", false
+	}
+
 	if podNameSlice[len(podNameSlice)-1] == "launcher" {
 		MPIJobName := strings.Join(podNameSlice[:len(podNameSlice)-1], "-")
 		return MPIJobName, true
@@ -105,8 +109,9 @@ func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName
 	if !found {
 		klog.Infof("Replicas not found")
 	}
+	klog.Infof("@#$%v", MPIJob.Object)
 
-	return requestGPUcount
+	return requestGPUcount + 1
 }
 
 func (sched *Scheduler) schedAnnotationSetter(pod *v1.Pod, schedStatus string) string {

@@ -21,16 +21,23 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/client-go/dynamic"
 	corelisters "k8s.io/client-go/listers/core/v1"
 	policylisters "k8s.io/client-go/listers/policy/v1"
+	"k8s.io/client-go/tools/clientcmd"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/klog/v2"
 	extenderv1 "k8s.io/kube-scheduler/extender/v1"
@@ -55,17 +62,6 @@ type candidate struct {
 	victims *extenderv1.Victims
 	name    string
 }
-
-// type candidate struct {
-// 	victims []victim
-// 	node    *v1.Node
-// }
-
-// type victim struct {
-// 	pod                *v1.Pod
-// 	backfilledResource int
-// 	scaledResource     int
-// }
 
 // Victims returns s.victims.
 func (s *candidate) Victims() *extenderv1.Victims {
@@ -142,137 +138,298 @@ type Evaluator struct {
 	Interface
 }
 
-// func (ev *Evaluator) ElasticScheduling(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
-// 	logger := klog.FromContext(ctx)
+func (ev *Evaluator) Dynamic(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
+	scalableModelData := make(map[string][]float64)
+	scalableModelData["VGG16"] = []float64{4.232, 3.499, 4.61, 4.526, 5.396, 6.363}
+	scalableModelData["VGG19"] = []float64{3.693, 2.793, 3.6294, 4.3105, 5.2051, 5.934}
+	scalableModelData["inceptionv3"] = []float64{3.5, 5.495, 6.29, 8.449, 9.693, 11.262}
+	scalableModelData["alex-net"] = []float64{15.969, 7.496, 9.002, 10.572, 13.005, 14.708}
+	scalableModelData["resnet50"] = []float64{6.78098, 7.777, 12.4701, 12.18717, 15.90254, 18.968}
+	scalableModelData["resnet101"] = []float64{4.253, 5.519, 8.863, 8.8171, 9.686, 12.904}
 
-// 	// 0) Fetch the latest version of <pod>.
-// 	// It's safe to directly fetch pod here. Because the informer cache has already been
-// 	// initialized when creating the Scheduler obj.
-// 	// However, tests may need to manually initialize the shared pod informer.
-// 	podNamespace, podName := pod.Namespace, pod.Name
-// 	pod, err := ev.PodLister.Pods(pod.Namespace).Get(pod.Name)
-// 	if err != nil {
-// 		logger.Error(err, "Could not get the updated preemptor pod object", "pod", klog.KRef(podNamespace, podName))
-// 		return nil, framework.AsStatus(err)
-// 	}
+	nodes, err := ev.Handler.ClientSet().CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		klog.Infof("Node info error")
+	}
+	var requestGPUs int64
+	for _, container := range pod.Spec.Containers {
+		if gpuRequest, ok := container.Resources.Requests["nvidia.com/gpu"]; ok {
+			requestGPUs = int64(gpuRequest.Value())
+		}
+	}
+	runningMPIJobs := ev.ListRunningMPIJob(ctx, nodes)
+	if err != nil {
+		klog.Fatalf("Failed to list MPIJobs: %s", err.Error())
+	}
+	idleGPUs := ev.idleGPUsinNodes(ctx, nodes)
+	resourceRetrieve, allocatableNodeName := ev.Retrieve(ctx, scalableModelData, nodes, idleGPUs, requestGPUs, runningMPIJobs)
 
-// 	// 0) Retrieve GPU resource (Retract & Scale-in)
-// 	// 0-1) Find all retrieve candidates.
-// 	// 유휴 자원 + 백필된 자원 + 스케일-아웃된 자원 중 뺄 수 있는 조합이 있는지 확인
-// 	candidates, err := ev.findRetrieveCandidates(ctx, pod, m)
-// 	if err != nil && len(candidates) == 0 {
-// 		return nil, framework.AsStatus(err)
-// 	}
+	if resourceRetrieve {
+		return framework.NewPostFilterResultWithNominatedNode(allocatableNodeName), framework.NewStatus(framework.Success)
+	}
 
-// 	// Return a FitError only when there are no candidates that fit the pod.
-// 	// 백필되거나 스케일-아웃된 자원이 없다 or 백필되거나 스케일-아웃된 자원으로 해결할 수 없다
-// 	// 자원 할당 단계로 넘어감
-// 	if len(candidates) == 0 {
-// 		// 전처리 (로그 찍기)
-// 		ev.ScaleOut(ctx, pod)
-// 	}
+	if idleGPUs == 0 {
+		return framework.NewPostFilterResultWithNominatedNode(""), framework.NewStatus(framework.Unschedulable, "Nothing can do")
+	}
+	var scaleOutMPIJobName string
+	maxThroughput := 0.0
+	for _, MPIJobName := range runningMPIJobs {
+		MPIJob, err := ev.GetMPIJob(ctx, "my-ns", MPIJobName)
+		if err != nil {
+			klog.Infof("Failed to get MPIJob: %v", err)
+		}
 
-// 	// 0-2) Select best candidate use SelectRetrieveCandidate func.
-// 	// 손익 모델 돌려서 최적의 조합 찾기
-// 	bestCandidate := ev.SelectCandidate(ctx, candidates)
-// 	if bestCandidate == nil || len(bestCandidate.Name()) == 0 {
-// 		return nil, framework.NewStatus(framework.Unschedulable, "no candidate node for preemption")
-// 	}
+		annotations, found, err := unstructured.NestedStringMap(MPIJob.Object, "metadata", "annotations")
+		if err != nil {
+			klog.Infof("Error loading annotations: %v", err)
+		}
+		if !found {
+			klog.Infof("Error finding annotations: %v", err)
+		}
 
-// 	// 자원 회수 진행
-// 	// 5) Perform preparation work before nominating the selected candidate.
-// 	if status := ev.prepareCandidate(ctx, bestCandidate, pod, ev.PluginName); !status.IsSuccess() {
-// 		return nil, status
-// 	}
+		usingGPUs, found, err := unstructured.NestedInt64(MPIJob.Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
+		if err != nil {
+			klog.Infof("Error reading replicas: %v", err)
+		}
+		if !found {
+			klog.Infof("Replicas not found")
+		}
+		usingGPUs += 1
+		if usingGPUs >= 6 {
+			continue
+		}
+		if maxThroughput < (scalableModelData[annotations["model-name"]][usingGPUs-1] - scalableModelData[annotations["model-name"]][usingGPUs-2]) {
+			maxThroughput = scalableModelData[annotations["model-name"]][usingGPUs-1] - scalableModelData[annotations["model-name"]][usingGPUs-2]
+			scaleOutMPIJobName = MPIJobName
+		}
+	}
 
-// 	// 1) Allocate GPU resource (Backfill & Scale-out)
+	ev.MPIJobScaling(ctx, "my-ns", scaleOutMPIJobName, 1)
+	return framework.NewPostFilterResultWithNominatedNode(""), framework.NewStatus(framework.Unschedulable, "Scale-Out MPIJob")
+}
 
-// 	return framework.NewPostFilterResultWithNominatedNode(bestCandidate.Name()), framework.NewStatus(framework.Success)
-// }
+func (ev *Evaluator) Retrieve(ctx context.Context, scalableModelData map[string][]float64, nodes *v1.NodeList, idleGPUs int64, requestGPUs int64, runningMPIJobs []string) (bool, string) {
+	var backfilledPods []v1.Pod
+	var scaleOutMPIJobs []*unstructured.Unstructured
+	for _, node := range nodes.Items {
+		pods, err := ev.Handler.ClientSet().CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name)})
+		if err != nil {
+			klog.Infof("PodList load error")
+			continue
+		}
+		for _, pod := range pods.Items {
+			if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "backfilled" {
+				backfilledPods = append(backfilledPods, pod)
+			}
+		}
+	}
+	for _, MPIJobName := range runningMPIJobs {
+		config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+		if err != nil {
+			klog.Infof("Failed to get in-cluster config: %v", err)
+		}
+		dynamicClient, err := dynamic.NewForConfig(config)
+		if err != nil {
+			klog.Infof("Failed to create dynamic client: %v", err)
+		}
+		gvr := schema.GroupVersionResource{
+			Group:    "kubeflow.org",
+			Version:  "v1",
+			Resource: "mpijobs",
+		}
+		MPIJob, err := dynamicClient.Resource(gvr).Namespace("my-ns").Get(ctx, MPIJobName, metav1.GetOptions{})
+		if err != nil {
+			klog.Infof("Failed to get MPIJob: %v", err)
+		}
 
-// // FindCandidates calculates a slice of retrieve candidates.
-// // Each candidate is executable to make the given <pod> schedulable.
-// func (ev *Evaluator) findRetrieveCandidates(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) ([]candidate, error) {
-// 	var candidates []candidate
-// 	allNodes, err := ev.Handler.SnapshotSharedLister().NodeInfos().List()
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	if len(allNodes) == 0 {
-// 		return nil, errors.New("no nodes available")
-// 	}
+		annotations, found, err := unstructured.NestedStringMap(MPIJob.Object, "metadata", "annotations")
+		if err != nil {
+			klog.Infof("Error loading annotations: %v", err)
+		}
+		if !found {
+			klog.Infof("Error finding annotations: %v", err)
+		}
 
-// 	logger := klog.FromContext(ctx)
-// 	potentialNodes, _ := nodesWhereRetrieveMightHelp(allNodes, m)
-// 	if len(potentialNodes) == 0 {
-// 		logger.V(3).Info("Retrieve will not help schedule pod on any node", "pod", klog.KObj(pod))
-// 		// In this case, we should clean-up any existing nominated node name of the pod.
-// 		if err := util.ClearNominatedNodeName(ctx, ev.Handler.ClientSet(), pod); err != nil {
-// 			logger.Error(err, "Could not clear the nominatedNodeName field of pod", "pod", klog.KObj(pod))
-// 			// We do not return as this error is not critical.
+		if _, check := annotations["scale-out"]; check {
+			scaleOutMPIJobs = append(scaleOutMPIJobs, MPIJob)
+		}
+	}
+
+	// needGPUs := requestGPUs - idleGPUs
+
+	// 필요한 자원과 가장 잘 맞는 조합 찾기 -> 필요한 것 -- 현재 돌고 있는 MPIJob 이름 및 네임스페이스, 해당 작업이 scale-out 한건지
+	// 그리고 회수 및 스케일-인 진행
+
+	return false, ""
+}
+
+func Contains(slice []string, target string) bool {
+	for _, item := range slice {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
+func (ev *Evaluator) idleGPUsinNodes(ctx context.Context, nodes *v1.NodeList) int64 {
+	capacityGPUcount := 0
+	allocatedGPUcount := 0
+	for _, node := range nodes.Items {
+		if val, ok := node.Status.Capacity["nvidia.com/gpu"]; ok {
+			capacityGPUcount += int(val.Value())
+		}
+		pods, err := ev.Handler.ClientSet().CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name)})
+		if err != nil {
+			klog.Infof("Pod loading error")
+			continue
+		}
+		for _, pod := range pods.Items {
+			for _, container := range pod.Spec.Containers {
+				if gpuRequest, ok := container.Resources.Requests["nvidia.com/gpu"]; ok {
+					allocatedGPUcount += int(gpuRequest.Value())
+				}
+			}
+		}
+	}
+	return int64(capacityGPUcount - allocatedGPUcount)
+}
+
+// func (ev *Evaluator) isAllPodsTriedBackfill() bool {
+// 	activeQ := ev.SchedulingQueue.GetPodsInActiveQueue()
+// 	unsQ := ev.SchedulingQueue.GetPodsInUnschedulablePods()
+// 	backoffQ := ev.SchedulingQueue.GetPodsInBackoffQueue()
+
+// 	for _, pod := range activeQ {
+// 		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+// 			continue
+// 		} else {
+// 			return false
 // 		}
-// 		return nil, nil
 // 	}
-
-// 	// 포텐셜 노드로부터 가능한 파드 쭉 뽑아오기 -> 여기서 candidate 정의함
-// 	for _, node := range potentialNodes {
-// 		var candidate candidate
-// 		candidate.node = node.Node()
-// 		pods := node.Pods
-// 		for _, pod := range pods {
-// 			var victim victim
-// 			if _, isBackfill := pod.Pod.ObjectMeta.Annotations["backfill-check"]; isBackfill {
-// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["backfill-check"])
-// 				victim.pod = pod.Pod
-// 				victim.backfilledResource = r
-// 				victim.scaledResource = 0
-// 				candidate.victims = append(candidate.victims, victim)
-// 			} else if _, isScaleOut := pod.Pod.ObjectMeta.Annotations["scale-out-check"]; isScaleOut {
-// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["scale-out-check"])
-// 				victim.pod = pod.Pod
-// 				victim.backfilledResource = 0
-// 				victim.scaledResource = r
-// 				candidate.victims = append(candidate.victims, victim)
-// 			}
-// 		}
-// 		candidates = append(candidates, candidate)
-// 	}
-
-// 	return candidates, err
-// }
-
-// // nodesWhereRetrieveMightHelp returns a list of nodes with failed predicates
-// // that may be satisfied by removing pods from the node.
-// func nodesWhereRetrieveMightHelp(nodes []*framework.NodeInfo, m framework.NodeToStatusMap) ([]*framework.NodeInfo, framework.NodeToStatusMap) {
-// 	var isBackfill, isScaleOut bool
-// 	var potentialNodes []*framework.NodeInfo
-// 	nodeStatuses := make(framework.NodeToStatusMap)
-// 	retractableResource := 0
-
-// 	for _, node := range nodes {
-// 		pods := node.Pods
-// 		isBackfill = false
-// 		isScaleOut = false
-// 		for _, pod := range pods {
-// 			if _, isBackfill = pod.Pod.ObjectMeta.Annotations["backfill-check"]; isBackfill {
-// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["backfill-check"])
-// 				retractableResource += r
-// 			} else if _, isScaleOut = pod.Pod.ObjectMeta.Annotations["scale-out-check"]; isScaleOut {
-// 				r, _ := strconv.Atoi(pod.Pod.ObjectMeta.Annotations["scale-out-check"])
-// 				retractableResource += r
-// 			}
-
-// 			if isBackfill || isScaleOut {
-// 				potentialNodes = append(potentialNodes, node)
-// 			}
+// 	for _, pod := range unsQ {
+// 		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+// 			continue
+// 		} else {
+// 			return false
 // 		}
 // 	}
-// 	return potentialNodes, nodeStatuses
+// 	for _, pod := range backoffQ {
+// 		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
+// 			continue
+// 		} else {
+// 			return false
+// 		}
+// 	}
+// 	return true
 // }
 
-// func (ev *Evaluator) ScaleOut(ctx context.Context, pod *v1.Pod) {
-// 	print("백필 여부 확인하고 스케일 아웃 진행")
-// }
+func (ev *Evaluator) GetMPIJob(ctx context.Context, ns string, MPIJobName string) (*unstructured.Unstructured, error) {
+	config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+	if err != nil {
+		klog.Infof("Failed to get in-cluster config: %v", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		klog.Infof("Failed to create dynamic client: %v", err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "kubeflow.org",
+		Version:  "v1",
+		Resource: "mpijobs",
+	}
+	MPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, MPIJobName, metav1.GetOptions{})
+	return MPIJob, err
+}
+
+func (ev *Evaluator) ListRunningMPIJob(ctx context.Context, nodes *v1.NodeList) []string {
+	var ListofRunningMPIJob []string
+	for _, node := range nodes.Items {
+		pods, err := ev.Handler.ClientSet().CoreV1().Pods("").List(ctx, metav1.ListOptions{FieldSelector: fmt.Sprintf("spec.nodeName=%s", node.Name)})
+		if err != nil {
+			klog.Infof("Pod load error")
+			continue
+		}
+		for _, pod := range pods.Items {
+			podNameSlice := strings.Split(pod.Name, "-")
+			if len(podNameSlice) < 2 {
+				continue
+			}
+
+			if podNameSlice[len(podNameSlice)-1] == "launcher" && podNameSlice[len(podNameSlice)-2] == "elastic" {
+				MPIJobName := strings.Join(podNameSlice[:len(podNameSlice)-1], "-")
+				if !Contains(ListofRunningMPIJob, MPIJobName) {
+					ListofRunningMPIJob = append(ListofRunningMPIJob, MPIJobName)
+				}
+			} else if podNameSlice[len(podNameSlice)-2] == "worker" && podNameSlice[len(podNameSlice)-3] == "elastic" {
+				MPIJobName := strings.Join(podNameSlice[:len(podNameSlice)-2], "-")
+				if !Contains(ListofRunningMPIJob, MPIJobName) {
+					ListofRunningMPIJob = append(ListofRunningMPIJob, MPIJobName)
+				}
+			}
+		}
+	}
+	klog.Infof("######%v######", ListofRunningMPIJob)
+	return ListofRunningMPIJob
+}
+
+func (ev *Evaluator) MPIJobScaling(ctx context.Context, ns string, MPIJobName string, scaleNum int64) {
+	config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
+	if err != nil {
+		klog.Infof("Failed to get in-cluster config: %v", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		klog.Infof("Failed to create dynamic client: %v", err)
+	}
+	gvr := schema.GroupVersionResource{
+		Group:    "kubeflow.org",
+		Version:  "v1",
+		Resource: "mpijobs",
+	}
+	MPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, MPIJobName, metav1.GetOptions{})
+	if err != nil {
+		klog.Infof("Failed to list MPIJobs: %v", err)
+	}
+
+	nowGPUcount, found, err := unstructured.NestedInt64(MPIJob.Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
+	if err != nil {
+		klog.Infof("Error reading replicas: %v", err)
+	}
+	if !found {
+		klog.Infof("Replicas not found")
+	}
+	nowGPUcount += 1
+
+	workerReplicasPath := []string{"spec", "mpiReplicaSpecs", "Worker", "replicas"}
+	if err := unstructured.SetNestedField(MPIJob.Object, int64(nowGPUcount+scaleNum), workerReplicasPath...); err != nil {
+		klog.Infof("Failed to set replicas: %v", err)
+	}
+
+	if scaleNum > 0 {
+		annotations, found, err := unstructured.NestedStringMap(MPIJob.Object, "metadata", "annotations")
+		if err != nil {
+			klog.Infof("Error loading annotations: %v", err)
+			return
+		}
+		if !found {
+			annotations = make(map[string]string)
+			annotations["scale-out"] = strconv.Itoa(int(scaleNum))
+		} else {
+			annotations["scale-out"] += strconv.Itoa(int(scaleNum))
+		}
+		if err := unstructured.SetNestedStringMap(MPIJob.Object, annotations, "metadata", "annotations"); err != nil {
+			klog.Infof("Failed to set annotations: %v", err)
+		}
+	}
+
+	updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Apply(ctx, MPIJobName, MPIJob, metav1.ApplyOptions{})
+	if err != nil {
+		klog.Infof("Failed to update MPIJob: %v", err)
+	}
+
+	klog.Infof("Updated Info : %v", updatedMPIJob.Object)
+}
 
 // Preempt returns a PostFilterResult carrying suggested nominatedNodeName, along with a Status.
 // The semantics of returned <PostFilterResult, Status> varies on different scenarios:
@@ -292,42 +449,6 @@ type Evaluator struct {
 //     and the non-empty nominatedNodeName will be applied to the preemptor pod.
 func (ev *Evaluator) Preempt(ctx context.Context, pod *v1.Pod, m framework.NodeToStatusMap) (*framework.PostFilterResult, *framework.Status) {
 	logger := klog.FromContext(ctx)
-
-	// ns := "my-ns"
-	// mpiJobName := "tensorflow-mnist-elastic"
-
-	// config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
-	// if err != nil {
-	// 	klog.Infof("Failed to get in-cluster config: %v", err)
-	// }
-
-	// dynamicClient, err := dynamic.NewForConfig(config)
-	// if err != nil {
-	// 	klog.Infof("Failed to create dynamic client: %v", err)
-	// }
-
-	// gvr := schema.GroupVersionResource{
-	// 	Group:    "kubeflow.org",
-	// 	Version:  "v1",
-	// 	Resource: "mpijobs",
-	// }
-
-	// mpiJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, mpiJobName, metav1.GetOptions{})
-	// if err != nil {
-	// 	klog.Infof("Failed to list MPIJobs: %v", err)
-	// }
-
-	// workerReplicasPath := []string{"spec", "mpiReplicaSpecs", "Worker", "replicas"}
-	// if err := unstructured.SetNestedField(mpiJob.Object, int64(5), workerReplicasPath...); err != nil {
-	// 	klog.Infof("Failed to set replicas: %v", err)
-	// }
-
-	// updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Update(ctx, mpiJob, metav1.UpdateOptions{})
-	// if err != nil {
-	// 	klog.Infof("Failed to update MPIJob: %v", err)
-	// }
-
-	// klog.Infof("%v | %v ", pod.Name, updatedMPIJob)
 
 	// 0) Fetch the latest version of <pod>.
 	// It's safe to directly fetch pod here. Because the informer cache has already been
@@ -558,7 +679,8 @@ func (ev *Evaluator) prepareCandidate(ctx context.Context, c Candidate, pod *v1.
 					}
 				}
 			}
-			if err := util.RetractPod(ctx, cs, victim); err != nil {
+			// RetractPod
+			if err := util.DeletePod(ctx, cs, victim); err != nil {
 				logger.Error(err, "Preempted pod", "pod", klog.KObj(victim), "preemptor", klog.KObj(pod))
 				errCh.SendErrorWithCancel(err, cancel)
 				return
