@@ -198,13 +198,14 @@ func (ev *Evaluator) Dynamic(ctx context.Context, pod *v1.Pod, m framework.NodeT
 		if usingGPUs >= 6 {
 			continue
 		}
-		if maxThroughput < (scalableModelData[annotations["model-name"]][usingGPUs-1] - scalableModelData[annotations["model-name"]][usingGPUs-2]) {
-			maxThroughput = scalableModelData[annotations["model-name"]][usingGPUs-1] - scalableModelData[annotations["model-name"]][usingGPUs-2]
+		if maxThroughput < (scalableModelData[annotations["model-name"]][usingGPUs] - scalableModelData[annotations["model-name"]][usingGPUs-1]) {
+			maxThroughput = scalableModelData[annotations["model-name"]][usingGPUs] - scalableModelData[annotations["model-name"]][usingGPUs-1]
 			scaleOutMPIJobName = MPIJobName
 		}
 	}
-
-	ev.MPIJobScaling(ctx, "my-ns", scaleOutMPIJobName, 1)
+	if maxThroughput > 0.0 {
+		ev.MPIJobScaling(ctx, "my-ns", scaleOutMPIJobName, 1)
+	}
 	return framework.NewPostFilterResultWithNominatedNode(""), framework.NewStatus(framework.Unschedulable, "Scale-Out MPIJob")
 }
 
@@ -422,12 +423,10 @@ func (ev *Evaluator) MPIJobScaling(ctx context.Context, ns string, MPIJobName st
 			klog.Infof("Failed to set annotations: %v", err)
 		}
 	}
-
-	updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Apply(ctx, MPIJobName, MPIJob, metav1.ApplyOptions{})
+	updatedMPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Update(ctx, MPIJob, metav1.UpdateOptions{})
 	if err != nil {
 		klog.Infof("Failed to update MPIJob: %v", err)
 	}
-
 	klog.Infof("Updated Info : %v", updatedMPIJob.Object)
 }
 
