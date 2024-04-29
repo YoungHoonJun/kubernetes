@@ -84,7 +84,7 @@ func (sched *Scheduler) checkMPIJob(podName string) (string, bool) {
 	return "", false
 }
 
-func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName string) int64 {
+func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName string, ns string) int64 {
 	config, err := clientcmd.BuildConfigFromFlags("", "/etc/kubernetes/scheduler.conf")
 	if err != nil {
 		klog.Infof("Failed to get in-cluster config: %v", err)
@@ -98,10 +98,11 @@ func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName
 		Version:  "v1",
 		Resource: "mpijobs",
 	}
-	MPIJob, err := dynamicClient.Resource(gvr).Namespace("my-ns").Get(ctx, MPIJobName, metav1.GetOptions{})
+	MPIJob, err := dynamicClient.Resource(gvr).Namespace(ns).Get(ctx, MPIJobName, metav1.GetOptions{})
 	if err != nil {
 		klog.Infof("Failed to list MPIJobs: %v", err)
 	}
+
 	requestGPUcount, found, err := unstructured.NestedInt64(MPIJob.Object, "spec", "mpiReplicaSpecs", "Worker", "replicas")
 	if err != nil {
 		klog.Infof("Error reading replicas: %v", err)
@@ -109,8 +110,8 @@ func (sched *Scheduler) getMPIJobRequestGPUcount(ctx context.Context, MPIJobName
 	if !found {
 		klog.Infof("Replicas not found")
 	}
-	klog.Infof("@#$%v", MPIJob.Object)
 
+	// For tensorflow job. If you want to use PyTorch for training, you have to return requestGPUcount
 	return requestGPUcount + 1
 }
 
@@ -122,10 +123,10 @@ func (sched *Scheduler) schedAnnotationSetter(pod *v1.Pod, schedStatus string) s
 	pod.Annotations["scheduling-state"] = schedStatus
 	sched.lock.Unlock()
 
-	if temp, check := pod.Annotations["scheduling-state"]; check {
-		return temp
+	if schedState, check := pod.Annotations["scheduling-state"]; check {
+		return schedState
 	} else {
-		return "ERROR"
+		return "Fail to set scheduling state"
 	}
 }
 
@@ -135,12 +136,14 @@ func (sched *Scheduler) updateAnnotations(ctx context.Context, ns string, name s
 		klog.Infof("%v", getErr)
 		klog.Infof("{%v} Fail to get", status)
 	}
+
 	setAnno := sched.schedAnnotationSetter(pod, schedStatus)
-	if setAnno == "ERROR" {
+	if setAnno == "Fail to set scheduling state" {
 		klog.Infof("{%v}Fail to load Annotation", status)
 	} else {
 		klog.Infof("{%v}Annotation: %v", status, setAnno)
 	}
+
 	_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
 	if updateErr != nil {
 		klog.Infof("%v", updateErr)
@@ -148,6 +151,7 @@ func (sched *Scheduler) updateAnnotations(ctx context.Context, ns string, name s
 	}
 }
 
+// check unscheduled state in activeQ, unschedulablePods, BackoffQ
 func (sched *Scheduler) checkUnscheduled(pods []*v1.Pod) bool {
 	for _, pod := range pods {
 		if schedStateOfPod, check := pod.Annotations["scheduling-state"]; check && schedStateOfPod == "unscheduled" {
@@ -201,22 +205,24 @@ func (sched *Scheduler) backfilledTOscheduled(ctx context.Context, nowPod *v1.Po
 					sched.lock.Lock()
 					pod.Annotations["scheduling-state"] = "scheduled"
 					sched.lock.Unlock()
-					klog.Infof("{1} backfilled -> scheduled || %v", pod.Name)
+					klog.Infof("backfilled -> scheduled || %v", pod.Name)
+
 					_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, &pod, metav1.UpdateOptions{})
 					if updateErr != nil {
 						klog.Infof("%v", updateErr)
-						klog.Infof("{bTs} Fail to update")
+						klog.Infof("Fail to update in backfilledTOscheduled")
 					}
 				}
 			} else {
 				sched.lock.Lock()
 				pod.Annotations["scheduling-state"] = "scheduled"
 				sched.lock.Unlock()
-				klog.Infof("{2} backfilled -> scheduled || %v", pod.Name)
+
+				klog.Infof("backfilled -> scheduled || %v", pod.Name)
 				_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, &pod, metav1.UpdateOptions{})
 				if updateErr != nil {
 					klog.Infof("%v", updateErr)
-					klog.Infof("{bTs} Fail to update")
+					klog.Infof("Fail to update in backfilledTOscheduled")
 				}
 			}
 		}
@@ -272,7 +278,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 		if isFirstAllocate {
 			capacityGPUcount := 0
 			allocatedGPUcount := 0
-			requestGPUcount := sched.getMPIJobRequestGPUcount(ctx, MPIJobName)
+			requestGPUcount := sched.getMPIJobRequestGPUcount(ctx, MPIJobName, "my-ns")
 			klog.Infof("Request GPU num : %v", requestGPUcount)
 
 			for _, node := range nodes.Items {
@@ -352,6 +358,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 	scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
 	if !status.IsSuccess() {
 		sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+		// Set pod status
 		if !isMPIJob {
 			sched.updateAnnotations(ctx, assumedPodInfo.Pod.Namespace, assumedPodInfo.Pod.Name, "Fail sched | Normal", "unscheduled")
 		}
@@ -399,6 +406,7 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 			} else {
 				setAnno = sched.schedAnnotationSetter(pod, "scheduled")
 			}
+
 			_, updateErr := sched.client.CoreV1().Pods(pod.Namespace).Update(ctx, pod, metav1.UpdateOptions{})
 			if updateErr != nil {
 				klog.Infof("%v", updateErr)
@@ -412,21 +420,22 @@ func (sched *Scheduler) scheduleOne(ctx context.Context) {
 				klog.Infof("%v", updateErr)
 				klog.Infof("{success sched} Fail to update")
 			}
+
 			if sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInActiveQueue()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInUnschedulablePods()) || sched.checkUnscheduled(sched.SchedulingQueue.GetPodsInBackoffQueue()) {
 				isUnsched = true
 			}
 			sched.backfilledTOscheduled(ctx, assumedPodInfo.PodInfo.Pod, isUnsched)
 		}
-		if setAnno == "ERROR" {
+		if setAnno == "Fail to set scheduling state" {
 			klog.Infof("{success sched}Fail to load Annotation")
 		} else {
 			klog.Infof("{success sched}Annotation: %v", setAnno)
 		}
 
-		pods, _ := sched.client.CoreV1().Pods("my-ns").List(ctx, metav1.ListOptions{})
-		for _, pod := range pods.Items {
-			klog.Infof("%v || %v || %v", pod.Name, pod.CreationTimestamp, pod.Annotations)
-		}
+		// pods, _ := sched.client.CoreV1().Pods("my-ns").List(ctx, metav1.ListOptions{})
+		// for _, pod := range pods.Items {
+		// 	klog.Infof("%v || %v || %v", pod.Name, pod.CreationTimestamp, pod.Annotations)
+		// }
 	}()
 }
 

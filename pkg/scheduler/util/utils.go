@@ -201,10 +201,17 @@ func RetractPod(ctx context.Context, cs kubernetes.Interface, pod *v1.Pod) error
 		return fmt.Errorf("failed to delete the pod: %v", deleteErr)
 	}
 
-	_, createErr := cs.CoreV1().Pods(victimPod.Namespace).Create(ctx, victimPod, metav1.CreateOptions{})
-	if createErr != nil {
-		return fmt.Errorf("failed to create the pod: %v", createErr)
-	}
+	go func() {
+		time.Sleep(10 * time.Second)
+		_, createErr := cs.CoreV1().Pods(victimPod.Namespace).Create(context.TODO(), victimPod, metav1.CreateOptions{})
+		if createErr != nil {
+			klog.Infof("Retract Error.")
+		}
+	}()
+	// _, createErr := cs.CoreV1().Pods(victimPod.Namespace).Create(ctx, victimPod, metav1.CreateOptions{})
+	// if createErr != nil {
+	// 	return fmt.Errorf("failed to create the pod: %v", createErr)
+	// }
 
 	return nil
 }
